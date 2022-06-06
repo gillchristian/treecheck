@@ -1,31 +1,32 @@
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE DeriveAnyClass #-}
 
 module Lib where
 
-import qualified Data.List as List
-import Text.Casing (camel)
+import Control.Monad (unless, void, when)
+import qualified Data.Aeson as Json
 import qualified Data.Bifunctor as BF
+import qualified Data.List as List
+import Data.Map (Map)
+import qualified Data.Map as Map
+import Data.Maybe (fromMaybe)
 import qualified Data.Maybe as Maybe
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
 import qualified Data.Yaml as Yaml
-import qualified Data.Aeson as Json
-import qualified Data.Map as Map
-import Data.Map (Map)
+import GHC.Generics (Generic)
 import qualified System.Directory as Dir
 import qualified System.Environment as Env
-import qualified System.Process as Proc
 import qualified System.Exit as Sys
-import qualified System.FilePath as Path
 import System.FilePath ((</>))
-import Control.Monad (when, unless, void)
-import Data.Maybe (fromMaybe)
-import GHC.Generics (Generic)
+import qualified System.FilePath as Path
+import qualified System.IO as Sys
+import qualified System.Process as Proc
+import Text.Casing (camel)
 
 dropLabelPrefix :: String -> Json.Options
 dropLabelPrefix prefix =
@@ -75,46 +76,62 @@ gitStatus path = Proc.readProcessWithExitCode "git" ["status", "-s", path] ""
 parseChanges :: Text -> [(FilePath, FileChangeType)]
 parseChanges status = pathAndChangeType . Text.stripStart <$> Text.lines status
   where
-  pathAndChangeType :: Text -> (FilePath, FileChangeType)
-  pathAndChangeType entry =
-    let [status, path] = Text.words entry
-     in (Text.unpack path, parse status)
+    pathAndChangeType :: Text -> (FilePath, FileChangeType)
+    pathAndChangeType entry =
+      let [status, path] = Text.words entry
+       in (Text.unpack path, parse status)
 
-  parse :: Text -> FileChangeType
-  parse s
-    | "A" `Text.isPrefixOf` s = Staged
-    | "M" `Text.isPrefixOf` s = Modified
-    | "D" `Text.isPrefixOf` s = Deleted
-    | "?" `Text.isPrefixOf` s = Added
-    | otherwise = error $ "Unrecognized status " <> Text.unpack s
+    parse :: Text -> FileChangeType
+    parse s
+      | "A" `Text.isPrefixOf` s = Staged
+      | "M" `Text.isPrefixOf` s = Modified
+      | "D" `Text.isPrefixOf` s = Deleted
+      | "?" `Text.isPrefixOf` s = Added
+      | otherwise = error $ "Unrecognized status " <> Text.unpack s
 
 checkProject :: Text -> Project -> IO (Either ProjectCheckFailure ())
-checkProject name Project { projectDirectory, projectCommand, projectOutput } =
-  Dir.withCurrentDirectory (Text.unpack $ fromMaybe  "." projectDirectory) $ do
-    Text.putStrLn $ "[" <> name <> "] Running"
+checkProject name Project {projectDirectory, projectCommand, projectOutput} =
+  Dir.withCurrentDirectory (Text.unpack $ fromMaybe "." projectDirectory) $ do
+    (statusCode, prevStatus, _) <- gitStatus $ Text.unpack projectOutput
 
-    -- TODO: validate this instead of unsafe pattern match
-    let (program:args) = words $ Text.unpack projectCommand
-    (cmdCode, _cmdStdOut, cmdStdErr) <- Proc.readProcessWithExitCode program args ""
+    let prevChanges = parseChanges $ Text.strip $ Text.pack prevStatus
+        hasPrevChanges = not $ null prevChanges
 
-    (statusCode, status, _) <- gitStatus $ Text.unpack projectOutput
+    if hasPrevChanges
+      then do
+        Text.putStrLn $ "[" <> name <> "] FAIL"
+        Text.putStrLn $ "[" <> name <> "] Directory is not clean"
+        Text.putStrLn $ "[" <> name <> "] Make sure to run treecheck with no pending changes"
+        putStrLn ""
+        putStrLn prevStatus
+        pure $ Left $ HadPreviousChanges prevStatus
+      else do
+        Text.putStrLn $ "[" <> name <> "] Running"
 
-    let changes = parseChanges $ Text.strip $ Text.pack status
-        hasChanges = not $ null changes
+        -- TODO: validate this instead of unsafe pattern match
+        let (program : args) = words $ Text.unpack projectCommand
+        (cmdCode, _cmdStdOut, cmdStdErr) <- Proc.readProcessWithExitCode program args ""
 
-    when hasChanges $ do
-      Text.putStrLn $ "[" <> name <> "] Failed"
-      putStrLn ""
-      putStrLn status
+        (statusCode, status, _) <- gitStatus $ Text.unpack projectOutput
 
-    unless hasChanges $ do
-      Text.putStrLn $ "[" <> name <> "] Success"
+        let changes = parseChanges $ Text.strip $ Text.pack status
+            hasChanges = not $ null changes
 
-    case (hasChanges, cmdCode, statusCode) of
-      (False, _, _) -> pure $ Right ()
-      (_, Sys.ExitFailure n, _) -> pure $ Left $ CmdError cmdStdErr n
-      (_, _, Sys.ExitFailure n) -> pure $ Left $ OtherError cmdStdErr n
-      (True, _, _) -> pure $ Left $ FilesChanged changes
+        when hasChanges $ do
+          Text.putStrLn $ "[" <> name <> "] FAIL"
+          Text.putStrLn $ "[" <> name <> "] Generated code not up to date"
+          Text.putStrLn $ "[" <> name <> "] Run " <> projectCommand <> " to fix"
+          putStrLn ""
+          putStrLn status
+
+        unless hasChanges $ do
+          Text.putStrLn $ "[" <> name <> "] SUCCESS"
+
+        case (hasChanges, cmdCode, statusCode) of
+          (False, _, _) -> pure $ Right ()
+          (_, Sys.ExitFailure n, _) -> pure $ Left $ CmdError cmdStdErr n
+          (_, _, Sys.ExitFailure n) -> pure $ Left $ OtherError cmdStdErr n
+          (True, _, _) -> pure $ Left $ FilesChanged changes
 
 -- | Recursively look for a file the current directory and all the parents, up
 -- to the current user's home directory.
@@ -122,23 +139,22 @@ findParentDirContaining :: FilePath -> IO (Maybe FilePath)
 findParentDirContaining file = do
   initial <- Dir.getCurrentDirectory
   Dir.withCurrentDirectory initial go
-
   where
-  go = do
-    current <- Dir.getCurrentDirectory
-    found <- Dir.doesFileExist $ current </> file
+    go = do
+      current <- Dir.getCurrentDirectory
+      found <- Dir.doesFileExist $ current </> file
 
-    -- Should drop both trailing path separator on both `home` and `parent`
-    -- to avoid failing the check and ending up on an infinite loop
-    home <- Path.dropTrailingPathSeparator <$> Dir.getHomeDirectory
-    let parent = Path.dropTrailingPathSeparator $ Path.dropFileName current
+      -- Should drop both trailing path separator on both `home` and `parent`
+      -- to avoid failing the check and ending up on an infinite loop
+      home <- Path.dropTrailingPathSeparator <$> Dir.getHomeDirectory
+      let parent = Path.dropTrailingPathSeparator $ Path.dropFileName current
 
-    case (found, home == parent) of
-      (True, _) -> pure $ Just current
-      (_, True) -> pure Nothing
-      (_, False) -> do
-        Dir.setCurrentDirectory parent
-        go
+      case (found, home == parent) of
+        (True, _) -> pure $ Just current
+        (_, True) -> pure Nothing
+        (_, False) -> do
+          Dir.setCurrentDirectory parent
+          go
 
 treecheckFile :: FilePath
 treecheckFile = "treecheck.yaml"
@@ -149,7 +165,7 @@ run = do
   case mbDir of
     Just dir -> Dir.setCurrentDirectory dir
     Nothing -> Sys.die $ "Could not find " <> treecheckFile
-  
+
   eProjects <- readConfigFile treecheckFile
   case eProjects of
     Right projects -> void $ Map.traverseWithKey checkProject projects
