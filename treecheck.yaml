@@ -1,0 +1,9 @@
+project-always-succed:
+  command: "./gen.sh"
+  directory: "sample/always-succeed"
+  output: "output"
+
+project-always-fail:
+  command: "./gen.sh"
+  directory: "sample/always-fail"
+  output: "output"
