@@ -2,11 +2,14 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module Lib where
 
 import Control.Monad (unless, void, when)
+import Control.Monad.IO.Class (MonadIO (liftIO))
+import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
 import qualified Data.Aeson as Json
 import qualified Data.Bifunctor as BF
 import qualified Data.List as List
@@ -19,6 +22,7 @@ import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
 import qualified Data.Yaml as Yaml
 import GHC.Generics (Generic)
+import qualified Git
 import qualified System.Directory as Dir
 import qualified System.Environment as Env
 import qualified System.Exit as Sys
@@ -55,83 +59,81 @@ readConfigFile path =
   BF.first Yaml.prettyPrintParseException
     <$> Yaml.decodeFileEither path
 
-data FileChangeType
-  = Modified
-  | Deleted
-  | Added
-  | Staged
-
 data ProjectCheckFailure
-  = FilesChanged [(FilePath, FileChangeType)]
-  | CmdError String Int
-  | OtherError String Int
-  | HadPreviousChanges String
+  = HadPreviousChanges Git.GitStatus
+  | FilesChanged Git.GitStatus
+  | CmdError (Int, String)
+  | OtherError (Int, String)
 
-gitDiff :: [FilePath] -> IO (Sys.ExitCode, String, String)
-gitDiff paths = Proc.readProcessWithExitCode "git" ("diff" : paths) ""
+checkStatus :: Text -> Project -> ExceptT ProjectCheckFailure IO ()
+checkStatus _ Project {..} = do
+  prevChanges <- liftIO $ Git.status $ Text.unpack projectOutput
 
-gitStatus :: FilePath -> IO (Sys.ExitCode, String, String)
-gitStatus path = Proc.readProcessWithExitCode "git" ["status", "-s", path] ""
+  case prevChanges of
+    Right changes | null changes -> pure ()
+    Right changes -> throwE $ HadPreviousChanges changes
+    Left err -> throwE $ OtherError err
 
-parseChanges :: Text -> [(FilePath, FileChangeType)]
-parseChanges status = pathAndChangeType . Text.stripStart <$> Text.lines status
-  where
-    pathAndChangeType :: Text -> (FilePath, FileChangeType)
-    pathAndChangeType entry =
-      let [status, path] = Text.words entry
-       in (Text.unpack path, parse status)
+runGen :: Text -> Project -> ExceptT ProjectCheckFailure IO ()
+runGen name Project {..} = do
+  let (program : args) = words $ Text.unpack projectCommand
+  (cmdCode, _cmdStdOut, cmdStdErr) <- liftIO $ Proc.readProcessWithExitCode program args ""
 
-    parse :: Text -> FileChangeType
-    parse s
-      | "A" `Text.isPrefixOf` s = Staged
-      | "M" `Text.isPrefixOf` s = Modified
-      | "D" `Text.isPrefixOf` s = Deleted
-      | "?" `Text.isPrefixOf` s = Added
-      | otherwise = error $ "Unrecognized status " <> Text.unpack s
+  case cmdCode of
+    Sys.ExitFailure code -> throwE $ CmdError (code, cmdStdErr)
+    _ -> pure ()
 
-checkProject :: Text -> Project -> IO (Either ProjectCheckFailure ())
-checkProject name Project {projectDirectory, projectCommand, projectOutput} =
+checkDiff :: Text -> Project -> ExceptT ProjectCheckFailure IO ()
+checkDiff name Project {..} = do
+  status <- liftIO $ Git.status $ Text.unpack projectOutput
+
+  case status of
+    Left (code, stderr) ->
+      throwE $ OtherError (code, stderr)
+    Right changes
+      | not $ null changes ->
+          throwE $ FilesChanged changes
+    _ -> pure ()
+
+reportProjectResult :: Text -> Project -> ProjectCheckFailure -> IO ()
+reportProjectResult name Project {..} result = do
+  Text.putStrLn $ "[" <> name <> "] FAIL"
+  case result of
+    HadPreviousChanges changes -> do
+      Text.putStrLn $ "[" <> name <> "] Directory is not clean"
+      Text.putStrLn $ "[" <> name <> "] Make sure to run treecheck with no pending changes"
+      putStrLn ""
+      Text.putStrLn $ Git.prettyStatus changes
+    FilesChanged changes -> do
+      Text.putStrLn $ "[" <> name <> "] Generated code not up to date"
+      Text.putStrLn $ "[" <> name <> "] Run " <> projectCommand <> " to fix"
+      putStrLn ""
+      Text.putStrLn $ Git.prettyStatus changes
+    CmdError (code, stderr) -> do
+      Text.putStrLn $ "[" <> name <> "] Generate command failed"
+      putStrLn ""
+      Sys.hPutStrLn Sys.stderr stderr
+    OtherError (code, stderr) -> do
+      Text.putStrLn $ "[" <> name <> "] Unexpected error"
+      putStrLn ""
+      Sys.hPutStrLn Sys.stderr stderr
+
+runProject :: Text -> Project -> IO Bool
+runProject name project@Project {..} =
   Dir.withCurrentDirectory (Text.unpack $ fromMaybe "." projectDirectory) $ do
-    (statusCode, prevStatus, _) <- gitStatus $ Text.unpack projectOutput
+    result <- runExceptT $ do
+      checkStatus name project
+      liftIO $ Text.putStrLn $ "[" <> name <> "] Running"
+      runGen name project
+      checkDiff name project
 
-    let prevChanges = parseChanges $ Text.strip $ Text.pack prevStatus
-        hasPrevChanges = not $ null prevChanges
-
-    if hasPrevChanges
-      then do
-        Text.putStrLn $ "[" <> name <> "] FAIL"
-        Text.putStrLn $ "[" <> name <> "] Directory is not clean"
-        Text.putStrLn $ "[" <> name <> "] Make sure to run treecheck with no pending changes"
-        putStrLn ""
-        putStrLn prevStatus
-        pure $ Left $ HadPreviousChanges prevStatus
-      else do
-        Text.putStrLn $ "[" <> name <> "] Running"
-
-        -- TODO: validate this instead of unsafe pattern match
-        let (program : args) = words $ Text.unpack projectCommand
-        (cmdCode, _cmdStdOut, cmdStdErr) <- Proc.readProcessWithExitCode program args ""
-
-        (statusCode, status, _) <- gitStatus $ Text.unpack projectOutput
-
-        let changes = parseChanges $ Text.strip $ Text.pack status
-            hasChanges = not $ null changes
-
-        when hasChanges $ do
-          Text.putStrLn $ "[" <> name <> "] FAIL"
-          Text.putStrLn $ "[" <> name <> "] Generated code not up to date"
-          Text.putStrLn $ "[" <> name <> "] Run " <> projectCommand <> " to fix"
-          putStrLn ""
-          putStrLn status
-
-        unless hasChanges $ do
-          Text.putStrLn $ "[" <> name <> "] SUCCESS"
-
-        case (hasChanges, cmdCode, statusCode) of
-          (False, _, _) -> pure $ Right ()
-          (_, Sys.ExitFailure n, _) -> pure $ Left $ CmdError cmdStdErr n
-          (_, _, Sys.ExitFailure n) -> pure $ Left $ OtherError cmdStdErr n
-          (True, _, _) -> pure $ Left $ FilesChanged changes
+    case result of
+      Left err -> do
+        reportProjectResult name project err
+        pure False
+      Right _ -> do
+        Text.putStrLn $ "[" <> name <> "] SUCCESS"
+        pure True
 
 -- | Recursively look for a file the current directory and all the parents, up
 -- to the current user's home directory.
@@ -168,7 +170,7 @@ run = do
 
   eProjects <- readConfigFile treecheckFile
   case eProjects of
-    Right projects -> void $ Map.traverseWithKey checkProject projects
+    Right projects -> void $ Map.traverseWithKey runProject projects
     Left err -> Sys.die err
 
 runOn :: FilePath -> IO ()
